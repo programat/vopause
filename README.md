@@ -23,5 +23,5 @@ Useful development modes:
 - SwiftPM-only app bundle, staged into `dist/Vopause.app`
 - development builds are ad-hoc signed with a stable designated requirement (`identifier dev.egor.vopause`) so Accessibility permission survives rebuilds after it is granted once
 - microphone activity is observed through CoreAudio device state; the app does not record audio
-- playback control first snapshots private MediaRemote player paths and sends discrete pause/play to those same system Now Playing sources; app-specific AppleScript, Control Center Now Playing Accessibility controls, app Playback-menu commands, and CoreAudio/global MediaRemote remain fallbacks
+- after the microphone activation debounce, playback control uses each supported player's AppleScript commands first. Remaining CoreAudio output sources can use Control Center, app Playback menus, browser automation, or MediaRemote
 - resume runs only after Vopause previously sent a discrete pause command; it does not use play/pause toggle

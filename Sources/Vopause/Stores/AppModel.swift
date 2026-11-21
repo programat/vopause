@@ -65,6 +65,7 @@ final class AppModel {
     private var stateMachine = MicActivityStateMachine()
     private var monitor: CoreAudioMicMonitor?
     private var reducerTickTask: Task<Void, Never>?
+    private var playbackTask: Task<Void, Never>?
     private var snoozeTask: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
 
@@ -195,11 +196,6 @@ final class AppModel {
     private func handle(snapshot: MicHardwareSnapshot) {
         inputDevices = snapshot.inputDevices
         monitorHealth = snapshot.health
-        let previousPhase = stateMachine.phase
-
-        if snapshot.rawActivity == .active {
-            pausePlaybackIfNeeded(mode: .fast, statusWhenSkipped: "Mic active")
-        }
 
         let commits = stateMachine.ingest(
             snapshot.rawActivity,
@@ -208,7 +204,6 @@ final class AppModel {
         )
         micPhase = stateMachine.phase
         apply(commits: commits)
-        reconcileCancelledEarlyPause(previousPhase: previousPhase)
         scheduleReducerTick()
     }
 
@@ -232,32 +227,24 @@ final class AppModel {
 
     private func handleMicBecameActive() {
         logger.info("Microphone became active")
-        guard canRunActions else {
-            statusMessage = "Mic active"
-            return
-        }
-
-        pausePlaybackIfNeeded(mode: .full, statusWhenSkipped: "Mic active")
+        statusMessage = "Mic active"
+        pausePlaybackIfNeeded()
     }
 
     private func handleMicBecameInactive() {
         logger.info("Microphone became inactive")
-        if autoResume {
-            statusMessage = "Mic idle"
-            resumePlaybackAfterMicrophone(statusWhenSkipped: "Mic idle")
-        } else {
-            clearPlaybackOwnership()
-            statusMessage = "Mic idle"
-        }
-    }
-
-    private func reconcileCancelledEarlyPause(previousPhase: MicActivityPhase) {
-        guard case .pendingActive = previousPhase, case .inactive = micPhase else {
-            return
-        }
-
-        resumePlaybackAfterMicrophone(statusWhenSkipped: "Mic idle")
         statusMessage = "Mic idle"
+        enqueuePlayback { model in
+            guard !model.micPhase.isCommittedActive else { return }
+            if model.autoResume {
+                let didResume = await model.playback.resumeAfterMicrophone()
+                if didResume, !model.micPhase.isCommittedActive, model.canRunActions {
+                    model.statusMessage = "Resumed playback"
+                }
+            } else {
+                await model.playback.clearOwnership()
+            }
+        }
     }
 
     private func reconcilePolicyChange() {
@@ -268,57 +255,33 @@ final class AppModel {
         }
 
         if micPhase.isCommittedActive {
-            pausePlaybackIfNeeded(mode: .full, statusWhenSkipped: "Mic active")
+            pausePlaybackIfNeeded()
         } else {
             statusMessage = "Utility active"
         }
     }
 
-    private func pausePlaybackIfNeeded(mode: PlaybackPauseMode, statusWhenSkipped: String) {
-        guard canRunActions else {
-            return
-        }
-
-        Task { [weak self] in
-            guard let self else {
-                return
+    private func pausePlaybackIfNeeded() {
+        enqueuePlayback { model in
+            guard model.canRunActions, model.micPhase.isCommittedActive else { return }
+            let didPause = await model.playback.pauseForMicrophone()
+            if didPause, model.canRunActions, model.micPhase.isCommittedActive {
+                model.statusMessage = "Paused playback"
             }
-
-            let didPause = await playback.pauseForMicrophone(mode: mode)
-            let ownsPause = await playback.ownsPause
-            guard canRunActions,
-                  stateMachine.lastRawActivity == .active || micPhase.isCommittedActive else {
-                return
-            }
-
-            statusMessage = didPause || ownsPause ? "Paused playback" : statusWhenSkipped
-        }
-    }
-
-    private func resumePlaybackAfterMicrophone(statusWhenSkipped: String) {
-        Task { [weak self] in
-            guard let self else {
-                return
-            }
-
-            let didResume = await playback.resumeAfterMicrophone()
-            guard !micPhase.isCommittedActive else {
-                return
-            }
-
-            statusMessage = didResume ? "Resumed playback" : statusWhenSkipped
         }
     }
 
     private func resumePlaybackSilently() {
-        Task { [playback] in
-            _ = await playback.resumeAfterMicrophone()
+        enqueuePlayback { model in
+            _ = await model.playback.resumeAfterMicrophone()
         }
     }
 
-    private func clearPlaybackOwnership() {
-        Task { [playback] in
-            await playback.clearOwnership()
+    private func enqueuePlayback(_ action: @escaping @MainActor (AppModel) async -> Void) {
+        playbackTask = Task { [weak self, previous = playbackTask] in
+            await previous?.value
+            guard let self else { return }
+            await action(self)
         }
     }
 

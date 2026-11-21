@@ -10,39 +10,17 @@ actor PlaybackCoordinator {
     private let controller = ScriptedPlaybackController()
     private let logger = Logger(subsystem: AppConstants.loggerSubsystem, category: "Playback")
     private var pauseTokens: [PauseToken] = []
-    private var lastReinforcementAt: Date?
-    private var reinforcementTask: Task<Void, Never>?
 
-    var ownsPause: Bool {
-        !pauseTokens.isEmpty
-    }
+    func pauseForMicrophone() -> Bool {
+        guard pauseTokens.isEmpty else { return true }
 
-    func pauseForMicrophone(mode: PlaybackPauseMode) -> Bool {
-        if !pauseTokens.isEmpty {
-            if mode == .full {
-                let existingKeys = Set(pauseTokens.map(\.key))
-                let newTokens = controller.pauseAllPlayingPlayers(mode: .full)
-                    .filter { !existingKeys.contains($0.key) }
-                if !newTokens.isEmpty {
-                    pauseTokens.append(contentsOf: newTokens)
-                    logger.info(
-                        "Paused \(newTokens.count, privacy: .public) additional player(s) for microphone activation"
-                    )
-                    return true
-                }
-            }
-
-            return reinforcePauseForMicrophone()
-        }
-
-        let tokens = controller.pauseAllPlayingPlayers(mode: mode)
+        let tokens = controller.pauseAllPlayingPlayers()
         guard !tokens.isEmpty else {
             logger.info("No playing player found; skipping automatic pause")
             return false
         }
 
         pauseTokens = tokens
-        startReinforcementBurst()
         logger.info("Paused \(tokens.count, privacy: .public) player(s) for microphone activation")
         return true
     }
@@ -53,10 +31,7 @@ actor PlaybackCoordinator {
         }
 
         let tokens = pauseTokens
-        pauseTokens = []
-        lastReinforcementAt = nil
-        reinforcementTask?.cancel()
-        reinforcementTask = nil
+        clearOwnership()
 
         let resumedCount = controller.resume(tokens)
         guard resumedCount > 0 else {
@@ -70,99 +45,19 @@ actor PlaybackCoordinator {
 
     func clearOwnership() {
         pauseTokens = []
-        lastReinforcementAt = nil
-        reinforcementTask?.cancel()
-        reinforcementTask = nil
     }
-
-    private func reinforcePauseForMicrophone() -> Bool {
-        let now = Date.now
-        if let lastReinforcementAt, now.timeIntervalSince(lastReinforcementAt) < 0.25 {
-            return false
-        }
-
-        lastReinforcementAt = now
-        guard controller.reinforcePause(pauseTokens) else {
-            return false
-        }
-
-        logger.info("Reinforced pause for microphone activation")
-        return true
-    }
-
-    private func startReinforcementBurst() {
-        reinforcementTask?.cancel()
-        reinforcementTask = Task { [weak self] in
-            for delay in [120_000_000, 320_000_000, 650_000_000] as [UInt64] {
-                try? await Task.sleep(nanoseconds: delay)
-                guard !Task.isCancelled else {
-                    return
-                }
-                guard let self else {
-                    return
-                }
-                _ = await self.reinforcePauseForMicrophone()
-            }
-        }
-    }
-}
-
-enum PlaybackPauseMode: Equatable, Sendable {
-    case fast
-    case full
 }
 
 private enum PauseToken {
     case mediaRemotePlayer(MediaRemotePlayerToken)
-    case systemNowPlaying(identity: NowPlayingIdentity?)
-    case mediaRemoteApp(AudioOutputProcess)
+    case systemNowPlaying(NowPlayingIdentity)
     case controlCenter(ControlCenterMediaTarget)
     case accessibilityMenu(AccessibilityMenuPlayer)
     case player(ScriptedPlayer)
     case browser(BrowserMediaTarget)
 
-    var key: String {
-        switch self {
-        case .mediaRemotePlayer(let player):
-            "mr-player:\(player.key)"
-        case .systemNowPlaying(let identity):
-            "system:\(identity?.key ?? "unknown")"
-        case .mediaRemoteApp(let process):
-            "remote:\(process.key)"
-        case .controlCenter(let target):
-            "control-center:\(target.key)"
-        case .accessibilityMenu(let player):
-            "ax-menu:\(player.key)"
-        case .player(let player):
-            "player:\(player.bundleID)"
-        case .browser(let target):
-            "browser:\(target.browser.bundleID):\(target.windowIndex):\(target.tabIndex):\(target.url)"
-        }
-    }
-
-    var bundleID: String? {
-        switch self {
-        case .mediaRemotePlayer(let player):
-            player.bundleID
-        case .systemNowPlaying(let identity):
-            identity?.bundleID ?? identity?.parentBundleID
-        case .mediaRemoteApp(let process):
-            process.bundleID
-        case .controlCenter(let target):
-            target.bundleID
-        case .accessibilityMenu(let player):
-            player.bundleID
-        case .player(let player):
-            player.bundleID
-        case .browser(let target):
-            target.browser.bundleID
-        }
-    }
-
     var outputProcess: AudioOutputProcess? {
         switch self {
-        case .mediaRemoteApp(let process):
-            process
         case .controlCenter(let target):
             target.source
         case .accessibilityMenu(let player):
@@ -178,19 +73,6 @@ private struct NowPlayingIdentity: Equatable {
     var parentBundleID: String?
     var processID: pid_t?
 
-    var key: String {
-        if let bundleID {
-            return "bundle:\(bundleID)"
-        }
-        if let parentBundleID {
-            return "parent:\(parentBundleID)"
-        }
-        if let processID {
-            return "pid:\(processID)"
-        }
-        return "unknown"
-    }
-
     func matches(_ other: NowPlayingIdentity) -> Bool {
         if let processID, let otherProcessID = other.processID, processID == otherProcessID {
             return true
@@ -205,15 +87,9 @@ private struct NowPlayingIdentity: Equatable {
     }
 }
 
-private struct MediaRemotePause {
-    var identity: NowPlayingIdentity?
-}
-
 private struct MediaRemotePlayerToken {
     var path: AnyObject
-    var key: String
     var displayName: String
-    var bundleID: String?
 }
 
 private struct MediaRemotePlayerSnapshot {
@@ -230,9 +106,7 @@ private struct MediaRemotePlayerSnapshot {
     var token: MediaRemotePlayerToken {
         MediaRemotePlayerToken(
             path: path,
-            key: key,
-            displayName: displayName,
-            bundleID: bundleID
+            displayName: displayName
         )
     }
 }
@@ -259,17 +133,6 @@ private struct ControlCenterMediaTarget: Equatable {
     var bundleID: String?
     var cardLabel: String
     var source: AudioOutputProcess
-
-    var key: String {
-        [
-            bundleID,
-            appDisplayName,
-            cardLabel,
-            source.key
-        ]
-            .compactMap { $0 }
-            .joined(separator: "|")
-    }
 }
 
 private struct ControlCenterPauseCandidate: Equatable {
@@ -296,6 +159,12 @@ private struct AudioOutputProcess: Equatable {
             return "pid:\(processID)"
         }
         return "name:\(displayName)"
+    }
+
+    func belongs(to appBundleID: String) -> Bool {
+        guard let bundleID = bundleID?.lowercased() else { return false }
+        let appBundleID = appBundleID.lowercased()
+        return bundleID == appBundleID || bundleID.hasPrefix("\(appBundleID).")
     }
 
     func matches(_ other: AudioOutputProcess) -> Bool {
@@ -342,26 +211,6 @@ private struct ScriptedPlayer: Equatable {
     var playCommand: String
 }
 
-private enum PlayerPlaybackState {
-    case playing
-    case paused
-    case stopped
-    case unknown
-
-    init(_ rawValue: String?) {
-        switch rawValue?.lowercased() {
-        case "playing":
-            self = .playing
-        case "paused":
-            self = .paused
-        case "stopped":
-            self = .stopped
-        default:
-            self = .unknown
-        }
-    }
-}
-
 private final class ScriptedPlaybackController {
     private let logger = Logger(subsystem: AppConstants.loggerSubsystem, category: "Playback")
     private let systemNowPlaying = MediaRemoteNowPlayingController()
@@ -392,201 +241,77 @@ private final class ScriptedPlaybackController {
         BrowserApp(bundleID: "company.thebrowser.Browser", scriptKind: .chrome)
     ]
 
-    func pauseAllPlayingPlayers(mode: PlaybackPauseMode) -> [PauseToken] {
-        let mediaRemotePlayers = systemNowPlaying.playingPlayerSnapshots()
-        if mediaRemotePlayers.isEmpty {
-            logger.info("No playing MediaRemote player paths captured before microphone pause")
-        } else {
-            let sources = mediaRemotePlayers.map(\.displayName).joined(separator: ", ")
-            logger.info("Captured MediaRemote player path(s): \(sources, privacy: .public)")
-        }
-
+    func pauseAllPlayingPlayers() -> [PauseToken] {
         let capturedOutput = outputReader.runningOutputProcesses()
-        if capturedOutput.isEmpty {
-            logger.info("No running CoreAudio output processes captured before microphone pause")
-        } else {
-            let sources = capturedOutput.map(\.displayName).joined(separator: ", ")
-            logger.info("Captured CoreAudio output process(es): \(sources, privacy: .public)")
-        }
-
         var tokens: [PauseToken] = []
-        var tokenKeys = Set<String>()
+        var handledBundleIDs = Set<String>()
 
-        func append(_ token: PauseToken) {
-            guard tokenKeys.insert(token.key).inserted else {
-                return
+        for player in runningSupportedPlayers() {
+            let result = execute("""
+                set playbackState to \(player.stateExpression)
+                if playbackState is not "playing" then return playbackState
+                \(player.pauseCommand)
+                return "paused by Vopause"
+                """, for: player)?.stringValue?.lowercased()
+            switch result {
+            case "paused by vopause":
+                handledBundleIDs.insert(player.bundleID)
+                tokens.append(.player(player))
+                logger.info("Sent AppleScript pause to \(player.displayName, privacy: .public)")
+            case "paused", "stopped":
+                handledBundleIDs.insert(player.bundleID)
+            default:
+                break
             }
-            tokens.append(token)
         }
 
-        for player in mediaRemotePlayers {
-            guard systemNowPlaying.pause(player) else {
-                continue
-            }
+        var remaining = outputReader.runningOutputProcesses(matching: capturedOutput.filter { process in
+            !handledBundleIDs.contains(where: process.belongs(to:))
+        })
 
-            append(.mediaRemotePlayer(player.token))
-        }
+        let controlCenterTokens = pauseControlCenterSources(remaining)
+        tokens += controlCenterTokens
+        let controlCenterSources = controlCenterTokens.compactMap(\.outputProcess)
+        remaining.removeAll { process in controlCenterSources.contains(where: process.matches) }
 
-        if mode == .fast {
-            if tokens.isEmpty,
-               systemNowPlaying.isAvailable,
-               let pause = systemNowPlaying.pauseIfPlaying() {
-                append(.systemNowPlaying(identity: pause.identity))
-            }
-
-            return tokens
-        }
-
-        let runningPlayersWithStates = runningSupportedPlayers().map { player in
-            (player: player, state: state(of: player))
-        }
-
-        let pausedMediaRemoteBundleIDs = Set(
-            tokens.compactMap { token -> String? in
-                guard case .mediaRemotePlayer(let player) = token else {
-                    return nil
-                }
-                return player.bundleID
-            }
-        )
-        for item in runningPlayersWithStates {
-            if pausedMediaRemoteBundleIDs.contains(item.player.bundleID) {
-                continue
-            }
-
-            guard item.state == .playing else {
-                continue
-            }
-
-            guard execute(item.player.pauseCommand, for: item.player) != nil else {
-                continue
-            }
-
-            append(.player(item.player))
-        }
+        let menuTokens = pauseAccessibilityMenuSources(remaining)
+        tokens += menuTokens
+        let menuSources = menuTokens.compactMap(\.outputProcess)
+        remaining.removeAll { process in menuSources.contains(where: process.matches) }
 
         for browser in runningSupportedBrowsers() {
-            if pausedMediaRemoteBundleIDs.contains(browser.bundleID) {
-                continue
+            let sources = remaining.filter { process in
+                process.belongs(to: browser.bundleID)
+                    || (browser.scriptKind == .safari && process.belongs(to: "com.apple.WebKit"))
             }
+            guard !sources.isEmpty else { continue }
 
-            for target in pausePlayingBrowserTabs(in: browser) {
-                append(.browser(target))
-            }
-        }
-
-        let claimedBundleIDs = Set(tokens.compactMap(\.bundleID))
-        let pausedScriptableBundleIDs = Set(
-            runningPlayersWithStates
-                .filter { $0.state == .paused || $0.state == .stopped }
-                .map(\.player.bundleID)
-        )
-        let ignoredBundleIDs = claimedBundleIDs
-            .union(pausedScriptableBundleIDs)
-            .union(pausedMediaRemoteBundleIDs)
-        let remainingOutput = outputReader.runningOutputProcesses(
-            matching: capturedOutput.filter { process in
-                guard let bundleID = process.bundleID else {
-                    return true
-                }
-                return !ignoredBundleIDs.contains(bundleID)
-            }
-        )
-
-        var remoteOutput = remainingOutput.isEmpty
-            ? capturedOutput.filter { process in
-                guard let bundleID = process.bundleID else {
-                    return true
-                }
-                return !ignoredBundleIDs.contains(bundleID)
-            }
-            : remainingOutput
-
-        if !remoteOutput.isEmpty {
-            let controlCenterTokens = pauseControlCenterSources(remoteOutput)
-            for token in controlCenterTokens {
-                append(token)
-            }
-
-            let controlCenterProcesses = controlCenterTokens.compactMap(\.outputProcess)
-            remoteOutput = remoteOutput.filter { process in
-                !controlCenterProcesses.contains { $0.matches(process) }
+            let targets = pausePlayingBrowserTabs(in: browser)
+            if !targets.isEmpty {
+                tokens += targets.map(PauseToken.browser)
+                remaining.removeAll { process in sources.contains(where: process.matches) }
             }
         }
 
-        if !remoteOutput.isEmpty {
-            let accessibilityTokens = pauseAccessibilityMenuSources(remoteOutput)
-            for token in accessibilityTokens {
-                append(token)
-            }
+        guard !remaining.isEmpty else { return tokens }
 
-            let accessibilityProcesses = accessibilityTokens.compactMap(\.outputProcess)
-            remoteOutput = remoteOutput.filter { process in
-                !accessibilityProcesses.contains { $0.matches(process) }
-            }
+        var pausedPaths = Set<String>()
+        for snapshot in systemNowPlaying.playingPlayerSnapshots() {
+            guard let bundleID = snapshot.bundleID,
+                  remaining.contains(where: { $0.belongs(to: bundleID) }),
+                  pausedPaths.insert(snapshot.key).inserted,
+                  systemNowPlaying.pause(snapshot.token) else { continue }
+
+            tokens.append(.mediaRemotePlayer(snapshot.token))
+            handledBundleIDs.insert(bundleID)
         }
 
-        if !remoteOutput.isEmpty {
-            let globalIdentity = remoteOutput.count == 1
-                ? remoteOutput.first?.nowPlayingIdentity
-                : systemNowPlaying.snapshotIdentity()
-            if systemNowPlaying.pauseUntilQuiet(capturedProcesses: remoteOutput, outputReader: outputReader) {
-                append(.systemNowPlaying(identity: globalIdentity))
-                for process in remoteOutput where process.bundleID != nil {
-                    append(.mediaRemoteApp(process))
-                }
-            }
-        }
-
-        if tokens.isEmpty,
-           systemNowPlaying.isAvailable,
-           let pause = systemNowPlaying.pauseIfPlaying() {
-            append(.systemNowPlaying(identity: pause.identity))
+        remaining.removeAll { process in handledBundleIDs.contains(where: process.belongs(to:)) }
+        if let identity = systemNowPlaying.pauseIfPlaying(matching: remaining) {
+            tokens.append(.systemNowPlaying(identity))
         }
 
         return tokens
-    }
-
-    func reinforcePause(_ tokens: [PauseToken]) -> Bool {
-        var didSendCommand = false
-
-        for token in tokens {
-            switch token {
-            case .mediaRemotePlayer(let player):
-                didSendCommand = systemNowPlaying.pause(player) || didSendCommand
-            case .systemNowPlaying:
-                didSendCommand = systemNowPlaying.pauseIfPlaying() != nil || didSendCommand
-            case .mediaRemoteApp:
-                continue
-            case .controlCenter:
-                continue
-            case .accessibilityMenu(let player):
-                didSendCommand = accessibilityMenu.pause(player) || didSendCommand
-            case .player(let player):
-                guard state(of: player) == .playing else {
-                    continue
-                }
-                didSendCommand = execute(player.pauseCommand, for: player) != nil || didSendCommand
-            case .browser:
-                continue
-            }
-        }
-
-        let capturedProcesses = tokens.compactMap { token -> AudioOutputProcess? in
-            if case .mediaRemoteApp(let process) = token {
-                return process
-            }
-            return nil
-        }
-        if !capturedProcesses.isEmpty {
-            didSendCommand = systemNowPlaying.pauseUntilQuiet(
-                capturedProcesses: capturedProcesses,
-                outputReader: outputReader,
-                maxPasses: 2
-            ) || didSendCommand
-        }
-
-        return didSendCommand
     }
 
     func resume(_ tokens: [PauseToken]) -> Int {
@@ -602,8 +327,6 @@ private final class ScriptedPlaybackController {
             switch token {
             case .mediaRemotePlayer(let player):
                 resumedCount += systemNowPlaying.resume(player) ? 1 : 0
-            case .mediaRemoteApp:
-                continue
             case .controlCenter:
                 continue
             case .accessibilityMenu(let player):
@@ -626,12 +349,11 @@ private final class ScriptedPlaybackController {
             return false
         }
 
-        let currentState = state(of: player)
-        guard currentState == .paused else {
-            return false
-        }
-
-        return execute(player.playCommand, for: player) != nil
+        return execute("""
+            if (\(player.stateExpression)) is not "paused" then return false
+            \(player.playCommand)
+            return true
+            """, for: player)?.booleanValue == true
     }
 
     private func runningSupportedPlayers() -> [ScriptedPlayer] {
@@ -796,31 +518,14 @@ private final class ScriptedPlaybackController {
         }
     }
 
-    private func state(of player: ScriptedPlayer) -> PlayerPlaybackState {
-        PlayerPlaybackState(execute("return \(player.stateExpression)", for: player))
-    }
-
-    @discardableResult
-    private func execute(_ body: String, for player: ScriptedPlayer) -> String? {
+    private func execute(_ body: String, for player: ScriptedPlayer) -> NSAppleEventDescriptor? {
         let source = """
         tell application id "\(player.bundleID)"
             \(body)
         end tell
         """
 
-        guard let script = NSAppleScript(source: source) else {
-            return nil
-        }
-
-        var errorInfo: NSDictionary?
-        let result = script.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-            logger.warning("\(player.displayName, privacy: .public) AppleScript failed: \(message, privacy: .public)")
-            return nil
-        }
-
-        return result.stringValue ?? result.description
+        return executeDescriptor(source, target: player.displayName)
     }
 
     private func pauseFirstPlayingBrowserTab(in browser: BrowserApp) -> BrowserMediaTarget? {
@@ -832,7 +537,7 @@ private final class ScriptedPlaybackController {
             source = safariPauseFirstPlayingTabScript(bundleID: browser.bundleID)
         }
 
-        guard let descriptor = executeDescriptor(source) else {
+        guard let descriptor = executeDescriptor(source, target: browser.bundleID) else {
             return nil
         }
 
@@ -870,11 +575,17 @@ private final class ScriptedPlaybackController {
             source = safariResumeScript(target: target)
         }
 
-        return executeDescriptor(source)?.booleanValue == true
+        return executeDescriptor(source, target: target.browser.bundleID)?.booleanValue == true
     }
 
-    private func executeDescriptor(_ source: String) -> NSAppleEventDescriptor? {
-        guard let script = NSAppleScript(source: source) else {
+    private func executeDescriptor(_ source: String, target: String) -> NSAppleEventDescriptor? {
+        // A stalled browser must release the playback queue before the default two-minute timeout.
+        let boundedSource = """
+        with timeout of 1 second
+        \(source)
+        end timeout
+        """
+        guard let script = NSAppleScript(source: boundedSource) else {
             return nil
         }
 
@@ -882,7 +593,7 @@ private final class ScriptedPlaybackController {
         let result = script.executeAndReturnError(&errorInfo)
         if let errorInfo {
             let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-            logger.warning("Browser AppleScript failed: \(message, privacy: .public)")
+            logger.warning("\(target, privacy: .public) AppleScript failed: \(message, privacy: .public)")
             return nil
         }
 
@@ -1431,10 +1142,6 @@ private final class MediaRemoteNowPlayingController {
     private let getDisplayName: ClientStringGetter?
     private let getProcessID: ClientPIDGetter?
 
-    var isAvailable: Bool {
-        sendCommand != nil || sendCommandToPlayer != nil
-    }
-
     init() {
         let handle = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW | RTLD_GLOBAL)
         guard let handle else {
@@ -1466,18 +1173,18 @@ private final class MediaRemoteNowPlayingController {
         getProcessID = Self.symbol(handle, "MRNowPlayingClientGetProcessIdentifier")
     }
 
-    func pauseIfPlaying() -> MediaRemotePause? {
-        guard currentIsPlaying() == true || currentPlaybackRateIsPlaying() else {
-            return nil
-        }
-
-        let identity = currentIdentity()
-        guard sendCommand?(Command.pause, nil) == true else {
+    func pauseIfPlaying(matching processes: [AudioOutputProcess]) -> NowPlayingIdentity? {
+        guard !processes.isEmpty,
+              let sendCommand,
+              let identity = currentIdentity(),
+              processes.compactMap(\.nowPlayingIdentity).contains(where: identity.matches),
+              currentIsPlaying() == true || currentPlaybackRateIsPlaying(),
+              sendCommand(Command.pause, nil) else {
             return nil
         }
 
         logger.info("Sent MediaRemote pause to System Now Playing")
-        return MediaRemotePause(identity: identity)
+        return identity
     }
 
     func playingPlayerSnapshots() -> [MediaRemotePlayerSnapshot] {
@@ -1487,18 +1194,8 @@ private final class MediaRemoteNowPlayingController {
         }
     }
 
-    func pause(_ snapshot: MediaRemotePlayerSnapshot) -> Bool {
-        pause(snapshot.token)
-    }
-
     func pause(_ token: MediaRemotePlayerToken) -> Bool {
         guard send(command: Command.pause, to: token.path) else {
-            return false
-        }
-
-        Thread.sleep(forTimeInterval: 0.04)
-        if isPlaying(path: token.path) {
-            logger.info("MediaRemote player-path pause did not quiet \(token.displayName, privacy: .public)")
             return false
         }
 
@@ -1520,49 +1217,7 @@ private final class MediaRemoteNowPlayingController {
         return true
     }
 
-    func pauseUntilQuiet(
-        capturedProcesses: [AudioOutputProcess],
-        outputReader: CoreAudioOutputProcessReader,
-        maxPasses: Int = 4
-    ) -> Bool {
-        guard !capturedProcesses.isEmpty, let sendCommand else {
-            return false
-        }
-
-        var didSend = false
-        for pass in 0..<maxPasses {
-            let stillPlaying = outputReader.runningOutputProcesses(matching: capturedProcesses)
-            guard !stillPlaying.isEmpty else {
-                return didSend
-            }
-
-            guard sendCommand(Command.pause, nil) else {
-                break
-            }
-
-            didSend = true
-            logger.info(
-                "Sent MediaRemote global pause pass \(pass + 1, privacy: .public) for \(stillPlaying.count, privacy: .public) output process(es)"
-            )
-            Thread.sleep(forTimeInterval: 0.045)
-        }
-
-        let finalStillPlaying = outputReader.runningOutputProcesses(matching: capturedProcesses)
-        if finalStillPlaying.isEmpty {
-            return didSend
-        }
-
-        let names = finalStillPlaying.map(\.displayName).joined(separator: ", ")
-        logger.info("MediaRemote pause did not quiet captured source(s): \(names, privacy: .public)")
-        return false
-    }
-
-    func resumeIfSafe(identity: NowPlayingIdentity?) -> Bool {
-        guard let identity else {
-            logger.info("Skipped MediaRemote resume because Now Playing identity was unavailable")
-            return false
-        }
-
+    func resumeIfSafe(identity: NowPlayingIdentity) -> Bool {
         guard currentIsPlaying() == false else {
             logger.info("Skipped MediaRemote resume because something is already playing")
             return false
@@ -1584,10 +1239,6 @@ private final class MediaRemoteNowPlayingController {
 
         logger.info("Sent MediaRemote play to System Now Playing")
         return true
-    }
-
-    func snapshotIdentity() -> NowPlayingIdentity? {
-        currentIdentity()
     }
 
     private func activePlayerPaths(timeout: TimeInterval = 0.5) -> [AnyObject] {

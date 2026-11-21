@@ -77,8 +77,27 @@ func runningDuringPendingInactiveKeepsActiveOwnership() {
     expect(machine.phase == .active(since: start), "active ownership should be preserved")
 }
 
+func repeatedHardwareSnapshotsCommitOnePlaybackCycle() {
+    var machine = MicActivityStateMachine()
+    let settings = MicActivitySettings(activationDebounce: 0.22, deactivationGrace: 0.9)
+    let start = Date(timeIntervalSinceReferenceDate: 50)
+    let snapshots: [(RawMicActivity, TimeInterval)] = [
+        (.active, 0), (.active, 0.1), (.inactive, 0.15),
+        (.active, 1), (.active, 1.23), (.active, 1.5),
+        (.inactive, 2), (.inactive, 2.5), (.inactive, 2.91)
+    ]
+    let commits = snapshots.flatMap { activity, seconds in
+        machine.ingest(activity, at: start.addingTimeInterval(seconds), settings: settings)
+    }
+    expect(commits == [
+        .becameActive(at: start.addingTimeInterval(1.23)),
+        .becameInactive(at: start.addingTimeInterval(2.91))
+    ], "one stable mic session should require one pause and one resume")
+}
+
 activeStateCommitsOnlyAfterDebounce()
 shortInputSpikeIsCancelled()
 inactiveStateCommitsOnlyAfterGracePeriod()
 runningDuringPendingInactiveKeepsActiveOwnership()
+repeatedHardwareSnapshotsCommitOnePlaybackCycle()
 print("VopauseCore smoke tests passed")
